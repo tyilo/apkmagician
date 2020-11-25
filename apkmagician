@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import secrets
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from subprocess import run
+from tempfile import TemporaryDirectory
+from typing import List, Optional
+
+import httpx
+import lief
+import packaging
+from iterfzf import iterfzf
+
+
+def remove_prefix(s: str, prefix: str) -> str:
+    assert s.startswith(prefix)
+    return s[len(prefix) :]
+
+
+def get_installed_package_ids() -> List[str]:
+    p = run(
+        ["adb", "shell", "pm", "list", "packages"],
+        capture_output=True,
+        encoding="utf-8",
+    )
+    return [remove_prefix(l, "package:") for l in p.stdout.splitlines()]
+
+
+def choose(l: List[str]) -> Optional[str]:
+    return iterfzf(l)
+
+
+def decompile_apk(apk_path: Path, output_path: Path) -> bool:
+    p = run(["apktool", "d", apk_path, "--force", "--out", output_path])
+    return p.returncode == 0
+
+
+def compile_apk(source_path: Path, output_path: Path) -> bool:
+    p = run(["apktool", "b", source_path, "--out", output_path, "--use-aapt2"])
+    return p.returncode == 0
+
+
+def sign_apk(apk_path: Path, output_dir: Path) -> bool:
+    p = run(["uber-apk-signer", "-a", apk_path, "--out", output_dir])
+    return p.returncode == 0
+
+
+def install_apk(apk_path: Path, package_id: str) -> bool:
+    if package_id in get_installed_package_ids():
+        run(["adb", "uninstall", package_id])
+
+    p = run(["adb", "install", "-t", apk_path])
+    return p.returncode == 0
+
+
+def pull_apk(package_id: str, output_path: Path) -> bool:
+    p = run(
+        ["adb", "shell", "pm", "path", package_id],
+        capture_output=True,
+        encoding="utf-8",
+    )
+    if p.returncode != 0:
+        return False
+
+    path = remove_prefix(p.stdout.strip(), "package:")
+
+    p2 = run(["adb", "pull", path, output_path])
+    return p2.returncode == 0
+
+
+XML_NS = {"android": "http://schemas.android.com/apk/res/android"}
+
+
+def parse_manifest(manifest_path: Path) -> ET.Element:
+    tree = ET.parse(manifest_path)
+    return tree.getroot()
+
+
+def get_package_id(manifest_root: ET.Element) -> str:
+    package_id = manifest_root.get("package")
+    assert package_id is not None
+    return package_id
+
+
+def get_launcher_activity(manifest_root: ET.Element) -> Optional[str]:
+    launcher_category = "android.intent.category.LAUNCHER"
+
+    launcher_activities = manifest_root.findall(
+        f'application/activity/intent-filter/category[@android:name="{launcher_category}"]/../..',
+        XML_NS,
+    )
+    if len(launcher_activities) == 0:
+        print(f"[!] No activity with intent category {launcher_category} found")
+        return None
+    elif len(launcher_activities) > 1:
+        print(f"[!] Multiple activities with intent category {launcher_category} found")
+        return None
+
+    launcher_activity = launcher_activities[0]
+    launcher_activity_name = launcher_activity.get(f"{{{XML_NS['android']}}}name")
+    return launcher_activity_name
+
+
+def get_smali_path(decompiled_path: Path, java_path: str) -> Path:
+    return decompiled_path / "smali_classes2" / (java_path.replace(".", "/") + ".smali")
+
+
+def create_unique_name(prefix: str) -> str:
+    return prefix + "_" + secrets.token_hex(16)
+
+
+def inject_smali_code(
+    smali_path: Path, method_prefix: str, locals_count: int, code: str
+) -> bool:
+    static_constructor = ".method static constructor <clinit>()V"
+
+    smali_lines = smali_path.read_text().splitlines()
+
+    class_type = None
+    static_constructor_line = None
+    for i, l in enumerate(smali_lines):
+        l = l.strip()
+        if l.startswith(".class"):
+            class_type = l.split()[-1]
+
+        if l.startswith(static_constructor):
+            static_constructor_line = i
+
+    if not class_type:
+        print(f"[!] Couldn't find class of {smali_path}")
+        return False
+
+    method_name = create_unique_name(method_prefix)
+    call_ins = f"    invoke-static {{}}, {class_type}->{method_name}()V"
+
+    if static_constructor_line is not None:
+        print("[-] Found static constructor, adding call at beginning")
+        smali_lines = (
+            smali_lines[: static_constructor_line + 1]
+            + [call_ins]
+            + smali_lines[static_constructor_line + 1 :]
+        )
+    else:
+        print("[-] No static constructor found, creating new")
+        smali_lines += f"""
+{static_constructor}
+    .locals 0
+{call_ins}
+    return-void
+.end method
+""".splitlines()
+
+    print("[-] Adding new static method with injected code")
+    smali_lines += f"""
+.method private static {method_name}()V
+    .locals {locals_count}
+    {code}
+    return-void
+.end method
+""".splitlines()
+
+    smali_path.write_text("\n".join(smali_lines))
+
+    return True
+
+
+def enable_webview_debugging(smali_path: Path) -> bool:
+    if "enableWebviewDebugging" in smali_path.read_text():
+        print("[-] Already patched")
+        return True
+
+    return inject_smali_code(
+        smali_path,
+        "enableWebviewDebugging",
+        1,
+        """
+    const/4 v0, 0x1
+    invoke-static {v0}, Landroid/webkit/WebView;->setWebContentsDebuggingEnabled(Z)V
+""",
+    )
+
+
+FRIDA_ARCHS = {
+    "armeabi": "arm",
+    "armeabi-v7a": "arm",
+    "arm64-v8a": "arm64",
+    "x86": "x86",
+    "x86_64": "x86_64",
+}
+FRIDA_CACHE_DIR = Path.home() / ".cache" / "frida-gadget"
+FRIDA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+FRIDA_RELASES_URL = "https://api.github.com/repos/frida/frida/releases?per_page=1"
+
+
+def download_frida_gadget():
+    async def download_gadget(
+        asset: dict, download_dir: Path, client: httpx.AsyncClient
+    ):
+        download_path = download_dir / asset["name"]
+        if (download_path.parent / download_path.stem).exists():
+            return
+
+        url = asset["browser_download_url"]
+        print(f"[-] Downloading {url}")
+        r = await client.get(url)
+        r.raise_for_status()
+        with download_path.open("xb") as f:
+            f.write(r.content)
+
+        run(["unxz", download_path], check=True)
+
+    async def download_gadgets():
+        async with httpx.AsyncClient() as client:
+            print(f"[-] Downloading info for latest frida release")
+            r = await client.get(FRIDA_RELASES_URL)
+            latest_release = r.json()[0]
+
+            version = latest_release["tag_name"]
+            download_dir = FRIDA_CACHE_DIR / version
+            download_dir.mkdir(parents=True, exist_ok=True)
+
+            android_gadgets = [
+                a
+                for a in latest_release["assets"]
+                if "gadget" in a["name"] and "android" in a["name"]
+            ]
+            await asyncio.gather(
+                *(download_gadget(a, download_dir, client) for a in android_gadgets)
+            )
+
+    asyncio.run(download_gadgets())
+
+
+def inject_frida_gadget(decompiled_path: Path) -> bool:
+    gadget_versions = sorted(
+        FRIDA_CACHE_DIR.iterdir(), key=lambda p: packaging.version.parse(p.name)
+    )
+    if not gadget_versions:
+        download_frida_gadget()
+        return inject_frida_gadget()
+
+    latest_version = gadget_versions[-1]
+    success = False
+    for arch_path in sorted((decompiled_path / "lib").iterdir()):
+        if not arch_path.is_dir():
+            continue
+
+        arch = arch_path.name
+        frida_arch = FRIDA_ARCHS.get(arch)
+        if not frida_arch:
+            print(f"[!] Unknown arch in lib: {arch}, skipping")
+            continue
+
+        libgadget = arch_path / "libgadget.so"
+        if libgadget.exists():
+            print(f"[-] libgadget.so already exists for {arch}")
+            continue
+
+        try:
+            other_lib = next(arch_path.glob("lib*.so"))
+        except StopIteration:
+            print(f"[!] No library found for {arch}")
+            continue
+
+        gadget_source = next(latest_version.glob(f"frida-gadget-*-{frida_arch}.so"))
+        shutil.copy(gadget_source, libgadget)
+
+        print(f"[-] Adding libgadget dependency into {other_lib}")
+        binary = lief.parse(str(other_lib))
+        binary.add_library("libgadget.so")
+        binary.write(str(other_lib))
+
+        success = True
+
+    return success
+
+
+def add_frida_gadget_config(decompiled_path: Path, config: str):
+    for arch_path in sorted((decompiled_path / "lib").iterdir()):
+        libgadget = arch_path / "libgadget.so"
+        if not libgadget.exists():
+            continue
+
+        config_path = arch_path / "libgadget.config.so"
+        print(f"[-] Writing libgadget config to {config_path}")
+        config_path.write_text(config)
+
+
+APKS_PATH = Path(__file__).absolute().parent / "apks"
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path_or_id", nargs="?")
+    parser.add_argument("--webview-debugging", action="store_true")
+    parser.add_argument("--frida-gadget", action="store_true")
+    parser.add_argument("--frida-config", type=argparse.FileType("r"))
+    args = parser.parse_args()
+
+    package_id = None
+    apk_path = None
+    decompiled_path = None
+
+    if not args.path_or_id:
+        installed_package_ids = get_installed_package_ids()
+        package_id = choose(installed_package_ids)
+        if not package_id:
+            return 1
+    else:
+        input_path = Path(args.path_or_id)
+        if (input_path / "apktool.yml").exists():
+            decompiled_path = input_path
+        elif input_path.is_file():
+            apk_path = input_path
+        else:
+            installed_package_ids = get_installed_package_ids()
+            if args.path_or_id in installed_package_ids:
+                package_id = args.path_or_id
+            else:
+                print(
+                    f"[!] {args.path_or_id} is neither a file nor a package id on your device"
+                )
+                return 1
+
+    if not decompiled_path:
+        if not apk_path:
+            assert package_id is not None
+            APKS_PATH.mkdir(parents=True, exist_ok=True)
+            apk_path = APKS_PATH / f"{package_id}.apk"
+            print(f"[-] Pulling apk for {package_id}")
+            if not pull_apk(package_id, apk_path):
+                print(f"[!] Failed to pull apk with id {package_id}")
+                return 1
+
+        decompiled_path = apk_path.parent / apk_path.stem
+
+        print("[-] Decompiling apk")
+        print()
+        if not decompile_apk(apk_path, decompiled_path):
+            return 1
+
+        print()
+
+    manifest = parse_manifest(decompiled_path / "AndroidManifest.xml")
+    if not package_id:
+        package_id = get_package_id(manifest)
+
+    if args.webview_debugging:
+        print("[-] Finding launcher activity")
+        launcher_activity = get_launcher_activity(manifest)
+        if not launcher_activity:
+            return 1
+
+        print(f"[+] Found launcher activity: {launcher_activity}")
+
+        launcher_smali_path = get_smali_path(decompiled_path, launcher_activity)
+
+        print("[-] Patching", launcher_smali_path)
+        if not enable_webview_debugging(launcher_smali_path):
+            return 1
+
+    if args.frida_gadget:
+        print("[-] Injecting frida gadget")
+        if not inject_frida_gadget(decompiled_path):
+            return 1
+
+    if args.frida_config:
+        print("[-] Adding frida gadget config")
+        add_frida_gadget_config(decompiled_path, args.frida_config.read())
+
+    print("[-] Building apk")
+    print()
+    dist_path = decompiled_path / "dist"
+    patched_path = dist_path / f"{package_id}.apk"
+    if not compile_apk(decompiled_path, patched_path):
+        return 1
+
+    print()
+
+    print("[-] Signing apk")
+    print()
+    if not sign_apk(patched_path, dist_path):
+        return 1
+
+    print()
+
+    result_apk_path = dist_path / f"{package_id}-aligned-debugSigned.apk"
+
+    print(f"[+] Successfully build: {result_apk_path}")
+
+    print("[-] Installing apk")
+    install_apk(result_apk_path, package_id)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
