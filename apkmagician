@@ -12,7 +12,7 @@ from typing import List, Optional
 
 import httpx
 import lief
-import packaging
+import packaging.version
 from iterfzf import iterfzf
 
 
@@ -214,7 +214,7 @@ def download_frida_gadget():
         run(["unxz", download_path], check=True)
 
     async def download_gadgets():
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             print(f"[-] Downloading info for latest frida release")
             r = await client.get(FRIDA_RELASES_URL)
             latest_release = r.json()[0]
@@ -241,7 +241,7 @@ def inject_frida_gadget(decompiled_path: Path) -> bool:
     )
     if not gadget_versions:
         download_frida_gadget()
-        return inject_frida_gadget()
+        return inject_frida_gadget(decompiled_path)
 
     latest_version = gadget_versions[-1]
     success = False
